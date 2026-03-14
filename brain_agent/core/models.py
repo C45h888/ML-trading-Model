@@ -1,9 +1,99 @@
 """
 Data Models - Pydantic models for type-safe data handling
 """
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, Union
 from datetime import datetime
+from enum import Enum
 from pydantic import BaseModel, Field, computed_field
+
+
+class EventType(str, Enum):
+    """Event types for the data pipeline"""
+    TRADE = "trade"
+    L2_UPDATE = "l2_update"
+
+
+class TradeTick(BaseModel):
+    """
+    Normalized trade tick from Hyperliquid.
+    Hyperliquid returns prices as strings with 6 decimal places.
+    """
+    timestamp: int
+    coin: str
+    price: float  # Already divided by 1e6 from Hyperliquid
+    size: float
+    side: str = Field(description="B for buy (bid), A for sell (ask)")
+    hash: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        return self.model_dump()
+
+
+class L2Update(BaseModel):
+    """
+    L2 orderbook update with top N levels.
+    Hyperliquid returns bids/asks as lists of [price, size] strings.
+    """
+    timestamp: int
+    coin: str
+    bids: List[Dict[str, Any]] = Field(default_factory=list, description="List of {px, sz} from Hyperliquid")
+    asks: List[Dict[str, Any]] = Field(default_factory=list, description="List of {px, sz} from Hyperliquid")
+    top_n: int = 5
+    
+    @computed_field
+    @property
+    def best_bid(self) -> Optional[float]:
+        """Best bid price"""
+        if not self.bids:
+            return None
+        # Hyperliquid returns px as string with 6 decimals
+        return float(self.bids[0].get("px", "0")) / 1e6 if self.bids else None
+    
+    @computed_field
+    @property
+    def best_ask(self) -> Optional[float]:
+        """Best ask price"""
+        if not self.asks:
+            return None
+        return float(self.asks[0].get("px", "0")) / 1e6 if self.asks else None
+    
+    @computed_field
+    @property
+    def spread(self) -> float:
+        """Bid-ask spread"""
+        if self.best_bid is None or self.best_ask is None:
+            return 0.0
+        return self.best_ask - self.best_bid
+    
+    @computed_field
+    @property
+    def mid_price(self) -> float:
+        """Mid price"""
+        if self.best_bid is None or self.best_ask is None:
+            return 0.0
+        return (self.best_bid + self.best_ask) / 2
+
+
+class Event(BaseModel):
+    """
+    Union type for trade and L2 events.
+    Used by the data pipeline to stream normalized events.
+    """
+    event_type: EventType
+    data: Union[TradeTick, L2Update]
+    
+    @computed_field
+    @property
+    def coin(self) -> str:
+        """Get coin from the event data"""
+        return self.data.coin
+    
+    @computed_field
+    @property
+    def timestamp(self) -> int:
+        """Get timestamp from the event data"""
+        return self.data.timestamp
 
 
 class Tick(BaseModel):
