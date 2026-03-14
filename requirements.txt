@@ -1,0 +1,25 @@
+# Core Data & Trading
+hyperliquid-python-sdk>=0.22.0    # Official Hyperliquid SDK (primary data source + execution)
+ccxt>=4.4.0                       # Fallback & multi-exchange experiments
+backtrader>=1.9.78.123            # Backtesting engine (as per your spec)
+
+# Data Processing & Orderflow Engine
+pandas>=2.2.0
+numpy>=1.26.0,<2.0.0  # Last version supporting Python 3.9
+
+# MCP Integration (Redis Pub/Sub + schemas)
+redis>=5.2.0
+pydantic>=2.10.0
+
+# Utilities
+python-dotenv>=1.0.0              # .env for API keys + config
+websockets>=13.0                  # Native WS support (Hyperliquid + future sources)
+asyncio                       # built-in, but ensure Python 3.11+
+
+# Optional for Sierra DTC (no extra pip needed, we use stdlib sockets)
+# If you want protobuf encoding later: protobuf>=5.0.0
+
+# Dev / Testing (install with pip install -e ".[dev]" later)
+pytest>=8.0.0
+black>=24.0.0
+ruff>=0.9.0

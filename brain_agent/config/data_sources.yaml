@@ -1,0 +1,35 @@
+# Data Sources Configuration
+# Pluggable architecture - switch between Hyperliquid and Sierra DTC
+
+default_source: hyperliquid
+
+symbols:
+  - BTC
+  - ETH
+  - SOL
+
+# Hyperliquid Configuration
+hyperliquid:
+  ws_url: wss://api.hyperliquid.xyz/ws
+  testnet: false
+  coins: ["BTC", "ETH", "SOL"]
+  # API URL is set via environment: MAINNET vs TESTNET
+
+# Sierra Chart DTC Configuration (optional - for visual validation)
+sierra_dtc:
+  host: 127.0.0.1
+  port: 11095          # Default Sierra DTC port
+  history_port: 11096
+  username: ""
+  password: ""
+  # Note: Requires running Sierra Chart instance as DTC server
+
+# Trading Configuration
+trading:
+  default_symbol: "BTC"
+  default_timeframe: "1m"  # 1m, 5m, 15m, 1h, 4h, 1d
+  initial_capital: 100000  # USD
+
+# Execution Modes
+execution:
+  mode: "paper"  # backtest, paper, live
