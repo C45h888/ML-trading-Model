@@ -1,12 +1,19 @@
 """
 Orderflow Engine - Centralized feature calculation
 Features used by ALL strategies: CVD, absorption, imbalance, delta, volume profile
+
+Supports both trade events and L2 orderbook updates.
 """
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
+import logging
 import pandas as pd
 import numpy as np
+
+from brain_agent.core.models import TradeTick, L2Update, Event, EventType
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,6 +46,37 @@ class OrderflowFeatures:
     high_price: float = 0.0
     low_price: float = 0.0
     close_price: float = 0.0
+    
+    # L2-specific metrics
+    l2_bid_volume: float = 0.0
+    l2_ask_volume: float = 0.0
+    l2_spread: float = 0.0
+    l2_best_bid: float = 0.0
+    l2_best_ask: float = 0.0
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for strategies"""
+        return {
+            "cvd": self.cvd,
+            "absorption_score": self.absorption_score,
+            "absorption_count": self.absorption_count,
+            "bid_ask_imbalance": self.bid_ask_imbalance,
+            "volume_imbalance": self.volume_imbalance,
+            "delta_divergence": self.delta_divergence,
+            "volume_profile_poc": self.volume_profile_poc,
+            "volume_profile_va": self.volume_profile_va,
+            "total_buy_volume": self.total_buy_volume,
+            "total_sell_volume": self.total_sell_volume,
+            "trade_count": self.trade_count,
+            "high_price": self.high_price,
+            "low_price": self.low_price,
+            "close_price": self.close_price,
+            "l2_bid_volume": self.l2_bid_volume,
+            "l2_ask_volume": self.l2_ask_volume,
+            "l2_spread": self.l2_spread,
+            "l2_best_bid": self.l2_best_bid,
+            "l2_best_ask": self.l2_best_ask
+        }
     
 
 class OrderflowEngine:
@@ -125,36 +163,149 @@ class OrderflowEngine:
         return features
     
     def process_l2(self, l2_data: Dict) -> OrderflowFeatures:
-        """Process L2 orderbook data"""
+        """
+        Process L2 orderbook data with improved calculations.
+        
+        Calculates:
+        - bid_ask_imbalance = sum(bid_sz) / sum(ask_sz) over top 5
+        - absorption using max size at best bid/ask with small spread change
+        """
         bids = l2_data.get("bids", [])
         asks = l2_data.get("asks", [])
         
         if not bids or not asks:
             return self._calculate_features()
         
-        # Calculate bid/ask imbalance
-        bid_volume = sum(size for _, size in bids[:10])
-        ask_volume = sum(size for _, size in asks[:10])
+        # Parse bids and asks (handle both tuple and dict formats)
+        parsed_bids = []
+        parsed_asks = []
+        
+        for bid in bids[:10]:
+            if isinstance(bid, dict):
+                px = float(bid.get("px", "0")) / 1e6  # Hyperliquid format
+                sz = float(bid.get("sz", "0"))
+            else:
+                px, sz = float(bid[0]), float(bid[1])
+            parsed_bids.append((px, sz))
+        
+        for ask in asks[:10]:
+            if isinstance(ask, dict):
+                px = float(ask.get("px", "0")) / 1e6  # Hyperliquid format
+                sz = float(ask.get("sz", "0"))
+            else:
+                px, sz = float(ask[0]), float(ask[1])
+            parsed_asks.append((px, sz))
+        
+        if not parsed_bids or not parsed_asks:
+            return self._calculate_features()
+        
+        # Calculate volumes over top 5 levels
+        bid_volume = sum(sz for _, sz in parsed_bids[:5])
+        ask_volume = sum(sz for _, sz in parsed_asks[:5])
         
         total_volume = bid_volume + ask_volume
+        
+        # Calculate bid_ask_imbalance = sum(bid_sz) / sum(ask_sz) over top N
+        imbalance_ratio = bid_volume / ask_volume if ask_volume > 0 else 1.0
+        
         if total_volume > 0:
             self.l2_buffer.append({
                 "bid_volume": bid_volume,
                 "ask_volume": ask_volume,
-                "imbalance": (bid_volume - ask_volume) / total_volume
+                "imbalance": (bid_volume - ask_volume) / total_volume,
+                "imbalance_ratio": imbalance_ratio,
+                "best_bid": parsed_bids[0][0] if parsed_bids else 0,
+                "best_ask": parsed_asks[0][0] if parsed_asks else 0,
+                "spread": parsed_asks[0][0] - parsed_bids[0][0] if parsed_bids and parsed_asks else 0
             })
         
+        # Calculate absorption using L2 levels
+        # Large size at best bid/ask with small spread = absorption
+        self._calculate_l2_absorption(parsed_bids, parsed_asks)
+        
         return self._calculate_features()
+    
+    def _calculate_l2_absorption(self, bids: List, asks: List) -> None:
+        """
+        Calculate absorption from L2 data.
+        Large orders at best bid/ask with small spread changes indicate absorption.
+        """
+        if not bids or not asks:
+            return
+        
+        best_bid_px, best_bid_sz = bids[0]
+        best_ask_px, best_ask_sz = asks[0]
+        
+        spread = best_ask_px - best_bid_px
+        
+        if spread > 0 and self.last_price > 0:
+            # Check if price is near best levels
+            price_near_bid = self.last_price <= best_bid_px * 1.001  # Within 0.1%
+            price_near_ask = self.last_price >= best_ask_px * 0.999  # Within 0.1%
+            
+            if price_near_bid or price_near_ask:
+                # Large size at best level = potential absorption
+                max_size = max(best_bid_sz, best_ask_sz)
+                avg_size = sum(sz for _, sz in bids[:3] + asks[:3]) / 6
+                
+                if avg_size > 0:
+                    l2_absorption = (max_size / avg_size) * (1 / (spread + 0.0001))
+                    
+                    if l2_absorption > self.absorption_threshold:
+                        self.absorption_events.append({
+                            "type": "L2",
+                            "score": l2_absorption,
+                            "spread": spread
+                        })
+    
+    def process_event(self, event: Event) -> OrderflowFeatures:
+        """
+        Process a unified Event (trade or L2 update).
+        
+        Args:
+            event: Event object with event_type and data
+            
+        Returns:
+            OrderflowFeatures with all calculated metrics
+        """
+        try:
+            if event.event_type == EventType.TRADE:
+                # Process as trade
+                tick = event.data
+                tick_dict = {
+                    "timestamp": tick.timestamp,
+                    "coin": tick.coin,
+                    "price": tick.price,
+                    "size": tick.size,
+                    "side": tick.side
+                }
+                return self.process_tick(tick_dict)
+                
+            elif event.event_type == EventType.L2_UPDATE:
+                # Process as L2 update
+                l2 = event.data
+                l2_dict = {
+                    "bids": [(float(b.get("px", "0")) / 1e6, float(b.get("sz", "0"))) for b in l2.bids],
+                    "asks": [(float(a.get("px", "0")) / 1e6, float(a.get("sz", "0"))) for a in l2.asks]
+                }
+                return self.process_l2(l2_dict)
+            
+            else:
+                logger.warning(f"Unknown event type: {event.event_type}")
+                return self._calculate_features()
+                
+        except Exception as e:
+            logger.error(f"Error processing event: {e}")
+            return self._calculate_features()
     
     def _calculate_features(self) -> OrderflowFeatures:
         """Calculate all orderflow features from current state"""
         
         # Convert buffer to DataFrame for calculations
-        if len(self.trades_buffer) == 0:
+        if len(self.trades_buffer) == 0 and len(self.l2_buffer) == 0:
             return OrderflowFeatures()
         
-        df = pd.DataFrame(self.trades_buffer)
-        
+        # Create features with current state
         features = OrderflowFeatures(
             cvd=self.cvd,
             total_buy_volume=self.total_buy_volume,
@@ -165,8 +316,14 @@ class OrderflowEngine:
             close_price=self.last_price
         )
         
-        # Calculate absorption score
-        features.absorption_score = self._calculate_absorption(df)
+        # Calculate absorption from trades
+        if len(self.trades_buffer) > 0:
+            try:
+                df = pd.DataFrame(self.trades_buffer)
+                features.absorption_score = self._calculate_absorption(df)
+            except Exception as e:
+                logger.warning(f"Error calculating absorption: {e}")
+        
         features.absorption_count = len(self.absorption_events)
         
         # Calculate volume imbalance
@@ -177,8 +334,34 @@ class OrderflowEngine:
         
         # Calculate L2 imbalance (from most recent)
         if len(self.l2_buffer) > 0:
-            latest_l2 = self.l2_buffer[-1]
-            features.bid_ask_imbalance = latest_l2.get("imbalance", 0.0)
+            try:
+                latest_l2 = self.l2_buffer[-1]
+                features.bid_ask_imbalance = latest_l2.get("imbalance", 0.0)
+                features.l2_bid_volume = latest_l2.get("bid_volume", 0.0)
+                features.l2_ask_volume = latest_l2.get("ask_volume", 0.0)
+                features.l2_spread = latest_l2.get("spread", 0.0)
+                features.l2_best_bid = latest_l2.get("best_bid", 0.0)
+                features.l2_best_ask = latest_l2.get("best_ask", 0.0)
+            except Exception as e:
+                logger.warning(f"Error getting L2 features: {e}")
+        
+        # Calculate delta divergence
+        if len(self.trades_buffer) > 0:
+            try:
+                df = pd.DataFrame(self.trades_buffer)
+                features.delta_divergence = self._calculate_delta_divergence(df)
+            except Exception as e:
+                logger.warning(f"Error calculating delta divergence: {e}")
+        
+        # Calculate volume profile POC
+        if len(self.trades_buffer) > 0:
+            try:
+                df = pd.DataFrame(self.trades_buffer)
+                features.volume_profile_poc = self._calculate_volume_profile_poc(df)
+            except Exception as e:
+                logger.warning(f"Error calculating volume profile POC: {e}")
+        
+        return features
         
         # Calculate delta divergence
         features.delta_divergence = self._calculate_delta_divergence(df)
