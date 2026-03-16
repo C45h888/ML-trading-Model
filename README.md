@@ -16,6 +16,49 @@ Later phases (CrewAI + DeepSeek-V3 decision layer, LSTM training, live VPS) will
 Nail the pluggable data pipeline + centralized orderflow engine.  
 No CrewAI, no LSTM training, no live trading yet.
 
+## System Requirements
+
+### Required System Dependencies
+
+| Software | Purpose | Installation |
+|----------|---------|---------------|
+| **Redis** | Real-time data streaming between WebSocket and strategy | [See below](#redis-installation) |
+
+### Redis Installation
+
+**macOS:**
+```bash
+brew install redis
+brew services start redis
+```
+
+**Linux/Ubuntu:**
+```bash
+sudo apt-get install redis-server
+sudo systemctl start redis
+```
+
+**Windows:**
+Download from https://github.com/tporadowski/redis/releases
+
+### Python Dependencies
+```bash
+pip install -r requirements.txt
+```
+
+## Quick Start
+
+```bash
+# Start Redis (required)
+redis-server
+
+# Run backtest with live data (30 seconds)
+python -m brain_agent.main --mode backtest --symbol BTC --duration-seconds 30
+
+# Run paper trading
+python -m brain_agent.main --mode paper --symbol BTC
+```
+
 ## Core Data Sources (Locked to These Two Only)
 We have narrowed to the only two viable options that give us **secure, high-resolution orderflow data** suitable for a production Python agent:
 

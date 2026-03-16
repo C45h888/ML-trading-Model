@@ -1,190 +1,192 @@
 """
-Absorption Strategy - Detect absorbing liquidity
+Absorption Strategy - L2-based absorption detection
 Trades when large orders are not moving price (absorption detected)
 
-L2-Aware: Uses bid_ask_imbalance and L2 metrics for better signal generation
+Based on 2026 Hyperliquid-optimized design:
+- Primary Trigger: Large resting size at best bid/ask with minimal price movement
+- Direction Confirmation: CVD + L2 level direction
+- Confidence Scoring: Multi-factor weighted combination
 """
-from typing import Dict
-from .base_strategy import BaseStrategy, StrategySignal, Signal
+from dataclasses import dataclass
+from typing import Literal, Optional, Dict
+
 from brain_agent.core.orderflow_engine import OrderflowFeatures
 
 
-class AbsorptionStrategy(BaseStrategy):
+@dataclass
+class Signal:
+    """Clean signal output dataclass"""
+    direction: Literal["LONG", "SHORT", "FLAT"]
+    confidence: float  # 0.0 to 1.0
+    reason: str
+    metadata: Optional[Dict] = None
+
+
+class AbsorptionStrategy:
     """
-    Absorption trading strategy.
+    Production-ready L2 absorption strategy.
     
-    Detects when large market orders are being absorbed by limit orders
-    without moving price significantly - indicating potential reversal.
+    Core Rules:
+    - Primary Trigger: Large resting size at best bid/ask with minimal price movement
+    - Formula: absorption_score = (max_level_size / avg_level_size) / (price_range + 1e-6)
+    - Threshold: absorption_score >= 4.0
     
-    Signal Logic:
-    - LONG: Strong absorption + positive CVD (buyers absorbing selling)
-    - SHORT: Strong absorption + negative CVD (sellers absorbing buying)
+    Direction Confirmation:
+    - If large size on best bid + positive CVD → LONG
+    - If large size on best ask + negative CVD → SHORT
     
-    Enhanced with L2 data:
-    - Uses bid_ask_imbalance for direction confirmation
-    - Validates L2 spread for liquidity
+    Confidence Scoring (multi-factor):
+    - Base: 60% from absorption_score
+    - +20% if strong CVD divergence (abs(delta_divergence) > 1.5)
+    - +20% if imbalance aligns
+    - Cap at 0.95
     """
     
     def __init__(
         self,
-        min_absorption_score: float = 4.0,
-        min_volume: float = 10.0,
-        min_trade_count: int = 10,
-        confidence_scaling: float = 10.0,
-        min_l2_spread: float = 0.0  # Minimum L2 spread to consider valid
+        min_score: float = 4.0,
+        min_level_size_ratio: float = 3.0,
+        max_price_move_pct: float = 0.0005,  # 0.05%
+        min_cvd_strength: float = 1.5,
+        min_trade_count: int = 10
     ):
-        super().__init__(name="AbsorptionStrategy")
-        self.min_absorption_score = min_absorption_score
-        self.min_volume = min_volume
+        self.min_score = min_score
+        self.min_level_size_ratio = min_level_size_ratio
+        self.max_price_move_pct = max_price_move_pct
+        self.min_cvd_strength = min_cvd_strength
         self.min_trade_count = min_trade_count
-        self.confidence_scaling = confidence_scaling
-        self.min_l2_spread = min_l2_spread
     
-    def generate_signal(
-        self, 
-        features: OrderflowFeatures, 
-        price: float
-    ) -> StrategySignal:
+    def generate_signal(self, features, price: float) -> Signal:
         """
-        Generate absorption-based trading signal using research-backed formula.
-        
-        Formula:
-        - score = (max_level_size / avg_level_size_last_10) / (price_range_last_5 + 1e-6)
-        - LONG: score > 4.0 + large buy volume absorbed at best bid + positive CVD
-        - SHORT: score > 4.0 + large sell volume absorbed at best ask + negative CVD
-        - Confidence: min(score / 8.0 + 0.2 * cvd_strength, 0.95)
+        Generate L2-based absorption signal.
         
         Args:
-            features: OrderflowFeatures from OrderflowEngine (type-safe)
+            features: OrderflowFeatures or dict with features
             price: Current price
             
         Returns:
-            StrategySignal with direction and confidence
+            Signal with direction, confidence, and reason
         """
-        # Use base class validation first
-        if not self.validate(features):
-            return StrategySignal(
-                signal=Signal.FLAT,
+        # Handle both OrderflowFeatures and dict input
+        if isinstance(features, dict):
+            # Convert dict to OrderflowFeatures-like object
+            features_dict = features
+            # Create a simple object with attribute access
+            class FeaturesWrapper:
+                def __init__(self, d):
+                    for k, v in d.items():
+                        setattr(self, k, v)
+            features = FeaturesWrapper(features_dict)
+        
+        # Validate minimum trade count
+        if features.trade_count < self.min_trade_count:
+            return Signal(
+                direction="FLAT",
                 confidence=0.0,
-                reason="Invalid features"
+                reason=f"Insufficient trade data ({features.trade_count} < {self.min_trade_count})"
             )
         
-        # Extract features using attribute access (type-safe)
-        absorption_score = features.absorption_score
-        cvd = features.cvd
-        volume_imbalance = features.volume_imbalance
-        trade_count = features.trade_count
-        bid_ask_imbalance = features.bid_ask_imbalance
+        # Get absorption score from features
+        score = features.absorption_score
         
-        # L2-specific features
+        # Primary trigger: absorption score threshold
+        if score < self.min_score:
+            return Signal(
+                direction="FLAT",
+                confidence=0.0,
+                reason=f"No significant absorption (score={score:.2f} < {self.min_score})"
+            )
+        
+        # Get L2 data for direction and extra filters
+        l2_bid_volume = getattr(features, 'l2_bid_volume', 0.0)
+        l2_ask_volume = getattr(features, 'l2_ask_volume', 0.0)
         l2_spread = getattr(features, 'l2_spread', 0.0)
         l2_best_bid = getattr(features, 'l2_best_bid', 0.0)
         l2_best_ask = getattr(features, 'l2_best_ask', 0.0)
-        l2_bid_volume = getattr(features, 'l2_bid_volume', 0.0)
-        l2_ask_volume = getattr(features, 'l2_ask_volume', 0.0)
         
-        # Validate minimum trade count
-        if trade_count < self.min_trade_count:
-            return StrategySignal(
-                signal=Signal.FLAT,
+        # Extra filter: Check price movement percentage
+        if features.high_price > 0 and features.low_price > 0:
+            price_range_pct = (features.high_price - features.low_price) / features.low_price
+            if price_range_pct > self.max_price_move_pct:
+                return Signal(
+                    direction="FLAT",
+                    confidence=0.0,
+                    reason=f"Price move too large ({price_range_pct:.4f} > {self.max_price_move_pct})"
+                )
+        
+        # Determine direction from CVD and L2 level
+        # Buy absorption: more bid liquidity + positive CVD
+        # Sell absorption: more ask liquidity + negative CVD
+        is_buy_absorption = (
+            features.cvd > 0 and 
+            l2_bid_volume >= l2_ask_volume
+        )
+        is_sell_absorption = (
+            features.cvd < 0 and 
+            l2_ask_volume >= l2_bid_volume
+        )
+        
+        if not (is_buy_absorption or is_sell_absorption):
+            return Signal(
+                direction="FLAT",
                 confidence=0.0,
-                reason=f"Insufficient trade data ({trade_count} < {self.min_trade_count})"
+                reason=f"No clear direction (CVD={features.cvd:+.2f}, bid_vol={l2_bid_volume:.2f}, ask_vol={l2_ask_volume:.2f})"
             )
         
-        # Research-backed absorption score calculation
-        # score = (max_level_size / avg_level_size_last_10) / (price_range_last_5 + 1e-6)
-        # Using existing absorption_score as base
-        if l2_bid_volume > 0 and l2_ask_volume > 0:
-            max_level = max(l2_bid_volume, l2_ask_volume)
-            avg_level = (l2_bid_volume + l2_ask_volume) / 2
-            price_range = features.high_price - features.low_price if features.high_price > 0 else 0
-            
-            # Enhanced absorption score
-            research_score = (max_level / (avg_level + 1e-6)) / (price_range + 1e-6)
-            # Combine with existing score
-            absorption_score = (absorption_score + research_score) / 2
+        direction = "LONG" if is_buy_absorption else "SHORT"
         
-        # Check absorption threshold
-        if absorption_score < self.min_absorption_score:
-            return StrategySignal(
-                signal=Signal.FLAT,
-                confidence=0.0,
-                reason=f"Absorption score {absorption_score:.2f} below threshold {self.min_absorption_score}"
-            )
+        # Confidence: weighted multi-factor combination
+        # Base: 60% from absorption_score
+        base_conf = (score / 10.0) * 0.6
         
-        # Check volume threshold
-        abs_cvd = abs(cvd)
-        if abs_cvd < self.min_volume:
-            return StrategySignal(
-                signal=Signal.FLAT,
-                confidence=0.0,
-                reason=f"CVD {abs_cvd:.2f} below minimum volume {self.min_volume}"
-            )
+        # +20% if strong CVD divergence
+        cvd_divergence_bonus = 0.2 if abs(features.delta_divergence) > self.min_cvd_strength else 0.0
         
-        # Validate L2 spread if we have L2 data
-        if l2_spread > 0 and l2_spread < self.min_l2_spread:
-            return StrategySignal(
-                signal=Signal.FLAT,
-                confidence=0.0,
-                reason=f"L2 spread {l2_spread:.2f} too tight (min: {self.min_l2_spread})"
-            )
+        # +20% if imbalance aligns
+        imbalance_bonus = 0.0
+        if direction == "LONG" and features.bid_ask_imbalance > 2.5:
+            imbalance_bonus = 0.2
+        elif direction == "SHORT" and features.bid_ask_imbalance < 0.4:
+            imbalance_bonus = 0.2
         
-        # Generate signal based on absorption + CVD direction + L2 imbalance
-        # Use both volume_imbalance and bid_ask_imbalance for confirmation
-        combined_imbalance = (volume_imbalance + bid_ask_imbalance) / 2
+        # Cap at 0.95
+        confidence = min(base_conf + cvd_divergence_bonus + imbalance_bonus, 0.95)
         
-        # Calculate CVD strength for confidence
-        cvd_strength = min(abs(cvd) / 1000, 1.0)  # Normalize to 0-1
+        # Build reason string
+        reason = (
+            f"Strong L2 absorption at {price:.0f} "
+            f"(score={score:.2f}, CVD={features.cvd:+.2f}, "
+            f"imbalance={features.bid_ask_imbalance:+.2f}, "
+            f"delta_div={features.delta_divergence:+.2f})"
+        )
         
-        # Research-backed confidence: min(score / 8.0 + 0.2 * cvd_strength, 0.95)
-        base_confidence = absorption_score / 8.0 + 0.2 * cvd_strength
-        confidence = min(base_confidence, 0.95)
+        # Build metadata
+        metadata = {
+            "absorption_score": score,
+            "cvd": features.cvd,
+            "volume_imbalance": features.volume_imbalance,
+            "bid_ask_imbalance": features.bid_ask_imbalance,
+            "delta_divergence": features.delta_divergence,
+            "trade_count": features.trade_count,
+            "l2_spread": l2_spread,
+            "l2_bid_volume": l2_bid_volume,
+            "l2_ask_volume": l2_ask_volume,
+            "l2_best_bid": l2_best_bid,
+            "l2_best_ask": l2_best_ask,
+            "price_range_pct": (features.high_price - features.low_price) / features.low_price if features.low_price > 0 else 0
+        }
         
-        if cvd > 0 and combined_imbalance > 0:
-            # Buying pressure being absorbed = potential bullish reversal
-            direction = Signal.LONG
-            reason = (
-                f"Absorption at bid (score={absorption_score:.2f}, CVD={cvd:+.1f}) | "
-                f"Imb={combined_imbalance:+.2f} | L2_spread={l2_spread:.2f}"
-            )
-            
-        elif cvd < 0 and combined_imbalance < 0:
-            # Selling pressure being absorbed = potential bearish reversal
-            direction = Signal.SHORT
-            reason = (
-                f"Absorption at ask (score={absorption_score:.2f}, CVD={cvd:+.1f}) | "
-                f"Imb={combined_imbalance:+.2f} | L2_spread={l2_spread:.2f}"
-            )
-        
-        else:
-            # Absorption but unclear direction
-            return StrategySignal(
-                signal=Signal.FLAT,
-                confidence=0.0,
-                reason=f"Absorption without clear direction (CVD={cvd:+.1f}, imbalance={combined_imbalance:+.2f})"
-            )
-        
-        return StrategySignal(
-            signal=direction,
+        return Signal(
+            direction=direction,
             confidence=confidence,
             reason=reason,
-            metadata={
-                "absorption_score": absorption_score,
-                "cvd": cvd,
-                "volume_imbalance": volume_imbalance,
-                "bid_ask_imbalance": bid_ask_imbalance,
-                "trade_count": trade_count,
-                "l2_spread": l2_spread,
-                "l2_best_bid": l2_best_bid,
-                "l2_best_ask": l2_best_ask,
-                "cvd_strength": cvd_strength
-            }
+            metadata=metadata
         )
     
     def __repr__(self) -> str:
         return (
             f"AbsorptionStrategy("
-            f"min_absorption={self.min_absorption_score}, "
-            f"min_volume={self.min_volume}, "
-            f"min_l2_spread={self.min_l2_spread})"
+            f"min_score={self.min_score}, "
+            f"min_level_size_ratio={self.min_level_size_ratio}, "
+            f"max_price_move_pct={self.max_price_move_pct})"
         )

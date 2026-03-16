@@ -60,7 +60,7 @@ class RedisSettings(BaseSettings):
     password: str = ""
     db: int = 0
     url: Optional[str] = None
-    
+
     @model_validator(mode='after')
     def build_url(self):
         """Build Redis URL from components"""
@@ -69,6 +69,30 @@ class RedisSettings(BaseSettings):
                 self.url = f"redis://:{self.password}@{self.host}:{self.port}/{self.db}"
             else:
                 self.url = f"redis://{self.host}:{self.port}/{self.db}"
+        return self
+
+
+class PostgresSettings(BaseSettings):
+    """PostgreSQL connection settings"""
+    model_config = SettingsConfigDict(
+        env_prefix="POSTGRES_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore"
+    )
+
+    host: str = "localhost"
+    port: int = 5432
+    user: str = "trader"
+    password: str = ""
+    db: str = "trading"
+    dsn: Optional[str] = None
+
+    @model_validator(mode='after')
+    def build_dsn(self):
+        if self.dsn is None:
+            self.dsn = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}"
         return self
 
 
@@ -104,6 +128,7 @@ class Settings(BaseSettings):
     trading: TradingSettings = Field(default_factory=TradingSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
+    postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     
     # Additional settings
     symbols: List[str] = ["BTC", "ETH", "SOL"]

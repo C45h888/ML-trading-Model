@@ -44,19 +44,18 @@ class L2Update(BaseModel):
     @computed_field
     @property
     def best_bid(self) -> Optional[float]:
-        """Best bid price"""
+        """Best bid price — Hyperliquid returns px as decimal USD string e.g. '71760.0'"""
         if not self.bids:
             return None
-        # Hyperliquid returns px as string with 6 decimals
-        return float(self.bids[0].get("px", "0")) / 1e6 if self.bids else None
-    
+        return float(self.bids[0].get("px", "0")) if self.bids else None
+
     @computed_field
     @property
     def best_ask(self) -> Optional[float]:
         """Best ask price"""
         if not self.asks:
             return None
-        return float(self.asks[0].get("px", "0")) / 1e6 if self.asks else None
+        return float(self.asks[0].get("px", "0")) if self.asks else None
     
     @computed_field
     @property

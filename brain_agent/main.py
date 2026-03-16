@@ -75,7 +75,7 @@ class BrainAgent:
         # Initialize strategies
         self.strategies = [
             AbsorptionStrategy(
-                min_absorption_score=4.0,
+                min_score=4.0,
                 min_volume=10.0
             )
         ]
@@ -134,11 +134,11 @@ class BrainAgent:
                 for strategy in self.strategies:
                     signal = strategy.generate_signal(features, tick.price)
                     
-                    if signal.signal.value != "FLAT":
+                    if signal.direction != "FLAT":
                         signals_generated += 1
                         logger.info(
                             "signal_generated",
-                            direction=signal.signal.value,
+                            direction=signal.direction,
                             confidence=signal.confidence,
                             reason=signal.reason
                         )
@@ -218,11 +218,11 @@ class BrainAgent:
                 for strategy in self.strategies:
                     signal = strategy.generate_signal(features, tick.price)
                     
-                    if signal.signal.value != "FLAT":
+                    if signal.direction != "FLAT":
                         signals_generated += 1
                         logger.info(
                             "live_signal",
-                            direction=signal.signal.value,
+                            direction=signal.direction,
                             confidence=signal.confidence,
                             reason=signal.reason
                         )

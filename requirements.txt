@@ -1,14 +1,35 @@
+# Brain Agent - ML Trading System
+# Install with: pip install -r requirements.txt
+
+# ============================================================
+# SYSTEM REQUIREMENTS (must be installed separately)
+# ============================================================
+# Redis Server - Required for real-time data streaming
+# 
+# Install on macOS:
+#   brew install redis
+#   brew services start redis
+#
+# Install on Linux/Ubuntu:
+#   sudo apt-get install redis-server
+#   sudo systemctl start redis
+#
+# Install on Windows:
+#   Download from https://github.com/tporadowski/redis/releases
+# ============================================================
+
 # Core Data & Trading
 hyperliquid-python-sdk>=0.22.0    # Official Hyperliquid SDK (primary data source + execution)
 ccxt>=4.4.0                       # Fallback & multi-exchange experiments
-backtrader>=1.9.78.123            # Backtesting engine (as per your spec)
+backtrader>=1.9.78.123            # Backtesting engine
 
 # Data Processing & Orderflow Engine
 pandas>=2.2.0
 numpy>=1.26.0,<2.0.0  # Last version supporting Python 3.9
 
 # MCP Integration (Redis Pub/Sub + schemas)
-redis>=5.2.0
+redis>=5.2.0                       # Redis Python client (requires Redis server above)
+asyncpg>=0.29.0                    # Async PostgreSQL driver for trade/signal logging
 pydantic>=2.10.0
 pydantic-settings>=2.5.0          # Type-safe settings management
 tenacity>=9.0.0                    # Retry logic for WS connections
@@ -16,14 +37,10 @@ structlog>=25.1.0                  # Structured logging
 
 # Utilities
 python-dotenv>=1.0.0              # .env for API keys + config
-websockets>=13.0                  # Native WS support (Hyperliquid + future sources)
-pyyaml>=6.0.2                     # YAML configuration loading
-asyncio                       # built-in, but ensure Python 3.11+
+websockets>=13.0                 # Native WS support (Hyperliquid + future sources)
+pyyaml>=6.0.2                   # YAML configuration loading
 
-# Optional for Sierra DTC (no extra pip needed, we use stdlib sockets)
-# If you want protobuf encoding later: protobuf>=5.0.0
-
-# Dev / Testing (install with pip install -e ".[dev]" later)
+# Dev / Testing
 pytest>=8.0.0
 black>=24.0.0
 ruff>=0.9.0

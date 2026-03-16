@@ -95,9 +95,10 @@ class HyperliquidSource(BaseDataSource):
         self._subscriptions: Dict[str, Callable] = {}
         self._trades_callbacks: Dict[str, Callable] = {}
         self._l2_callbacks: Dict[str, Callable] = {}
-        self._redis = redis_client  # Redis client for publishing
-        
-        # Event buffers for backtest startup (last 500 events per coin)
+        self._redis = redis_client
+        self._main_loop = None  # Saved in connect() for thread-safe Redis publishing
+
+        # Event buffers (last 500 events per coin)
         from collections import deque
         coins = self.settings.hyperliquid.coins
         self._trades_buffer: Dict[str, deque] = {coin: deque(maxlen=500) for coin in coins}
@@ -139,6 +140,9 @@ class HyperliquidSource(BaseDataSource):
     
     async def connect(self) -> None:
         """Connect to Hyperliquid with WebSocket subscriptions"""
+        # Save the running event loop so callbacks in SDK threads can publish safely
+        self._main_loop = asyncio.get_event_loop()
+
         try:
             await self._connect_with_retry()
         except Exception as e:
@@ -166,16 +170,15 @@ class HyperliquidSource(BaseDataSource):
                 logger.warning(f"Failed to subscribe to {coin}: {e}")
     
     async def disconnect(self) -> None:
-        """Disconnect from Hyperliquid"""
+        """Disconnect from Hyperliquid and stop the SDK WebSocket thread."""
         self._running = False
-        
-        # Close WebSocket if available
-        if self._ws:
+
+        if self._info:
             try:
-                self._ws.close()
+                self._info.disconnect_websocket()
             except Exception as e:
-                logger.warning(f"Error closing WebSocket: {e}")
-        
+                logger.warning(f"Error disconnecting WebSocket: {e}")
+
         self._info = None
         self._ws = None
         logger.info("📴 Hyperliquid disconnected")
@@ -238,7 +241,14 @@ class HyperliquidSource(BaseDataSource):
                 channel = data.get("channel")
                 if channel == "l2Book":
                     l2_data = data.get("data", {})
-                    timestamp = l2_data.get("time", int(asyncio.get_event_loop().time() * 1000))
+                    # Use a default timestamp if no event loop available
+                    try:
+                        timestamp = l2_data.get("time", int(asyncio.get_event_loop().time() * 1000))
+                    except RuntimeError:
+                        # No event loop in callback thread - use current time
+                        import time
+                        timestamp = l2_data.get("time", int(time.time() * 1000))
+                    
                     levels = l2_data.get("levels", [[], []])  # [bids, asks]
                     
                     normalized = L2Update(
@@ -261,17 +271,15 @@ class HyperliquidSource(BaseDataSource):
             logger.error(f"Error in L2 callback for {coin}: {e}")
     
     def _publish_to_redis(self, channel: str, data: Any) -> None:
-        """Publish data to Redis channel"""
-        if self._redis:
+        """Publish data to Redis from a Hyperliquid SDK callback thread.
+        Uses run_coroutine_threadsafe so we don't need to be in the event loop.
+        """
+        if self._redis and self._main_loop:
             try:
-                import asyncio
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Schedule async publish in the running loop
-                    asyncio.create_task(self._async_publish(channel, data))
-                else:
-                    # No running loop, try to publish synchronously
-                    loop.run_until_complete(self._async_publish(channel, data))
+                asyncio.run_coroutine_threadsafe(
+                    self._async_publish(channel, data),
+                    self._main_loop,
+                )
             except Exception as e:
                 logger.debug(f"Redis publish error (non-critical): {e}")
     
@@ -296,17 +304,16 @@ class HyperliquidSource(BaseDataSource):
         return []
     
     def _normalize_trade(self, t: Dict, coin: str) -> TradeTick:
-        """
-        Normalize Hyperliquid trade to TradeTick.
-        Hyperliquid returns prices as strings with 6 decimal places.
+        """Normalize Hyperliquid trade to TradeTick.
+        Hyperliquid returns px as a decimal USD string e.g. '71760.0' — no division needed.
         """
         return TradeTick(
             timestamp=int(t.get("time", 0)),
             coin=coin,
-            price=float(t.get("px", "0")) / 1e6,  # Divide by 1e6
+            price=float(t.get("px", "0")),
             size=float(t.get("sz", "0")),
-            side=t.get("side", "B"),  # B for buy, A for ask
-            hash=t.get("hash")
+            side=t.get("side", "B"),
+            hash=t.get("hash"),
         )
     
     def _normalize_l2(self, l2_data: Dict, coin: str, timestamp: int) -> L2Update:
@@ -322,67 +329,57 @@ class HyperliquidSource(BaseDataSource):
         )
     
     async def get_historical_trades(
-        self, 
-        coin: str, 
-        limit: int = 1000
+        self,
+        coin: str,
+        limit: int = 1000,
     ) -> list[Trade]:
-        """Get historical trades from Hyperliquid"""
+        """Get recent trades from Hyperliquid REST API.
+        Note: the public recentTrades endpoint returns the last ~10 trades only.
+        For larger datasets use streaming mode (--duration-seconds).
+        """
         if not self._info:
             logger.warning("Hyperliquid not connected")
             return []
-        
+
         try:
-            # Use info.all_trades method
-            trades_data = self._info.all_trades(coin)
+            trades_data = self._info.post("/info", {"type": "recentTrades", "coin": coin})
             trades = []
-            
-            for t in trades_data[:limit]:
+            for t in (trades_data or [])[:limit]:
                 trade = Trade(
                     timestamp=int(t.get("time", 0)),
                     coin=coin,
-                    price=float(t.get("px", "0")) / 1e6,  # Hyperliquid uses 6 decimal places
+                    price=float(t.get("px", "0")),
                     size=float(t.get("sz", "0")),
                     side=t.get("side", "B"),
-                    hash=t.get("hash")
+                    hash=t.get("hash"),
                 )
                 trades.append(trade)
-            
-            logger.info(f"📊 Fetched {len(trades)} historical trades for {coin}")
+
+            logger.info(f"Fetched {len(trades)} recent trades for {coin} (REST API max ~10; use --duration-seconds for more)")
             return trades
-            
+
         except Exception as e:
             logger.error(f"Error fetching historical trades: {e}")
             return []
     
     async def get_l2_snapshot(self, coin: str) -> Optional[OrderbookSnapshot]:
-        """Get current L2 orderbook snapshot"""
+        """Get current L2 orderbook snapshot via l2_snapshot()."""
         if not self._info:
             return None
-        
+
         try:
-            l2_data = self._info.l2_book(coin)
-            timestamp = int(asyncio.get_event_loop().time() * 1000)
-            
-            # Convert Hyperliquid format to OrderbookSnapshot
-            bids = []
-            asks = []
-            
-            for bid in l2_data.get("bids", []):
-                px = float(bid[0]) / 1e6 if isinstance(bid[0], (int, str)) else 0
-                sz = float(bid[1]) if isinstance(bid[1], (int, str)) else 0
-                bids.append((px, sz))
-            
-            for ask in l2_data.get("asks", []):
-                px = float(ask[0]) / 1e6 if isinstance(ask[0], (int, str)) else 0
-                sz = float(ask[1]) if isinstance(ask[1], (int, str)) else 0
-                asks.append((px, sz))
-            
-            return OrderbookSnapshot(
-                timestamp=timestamp,
-                coin=coin,
-                bids=bids,
-                asks=asks
-            )
+            # SDK method is l2_snapshot, returns {'coin', 'time', 'levels': [[bids], [asks]]}
+            raw = self._info.l2_snapshot(coin)
+            timestamp = int(raw.get("time", asyncio.get_event_loop().time() * 1000))
+            levels = raw.get("levels", [[], []])
+            raw_bids = levels[0] if len(levels) > 0 else []
+            raw_asks = levels[1] if len(levels) > 1 else []
+
+            # px is a decimal USD string e.g. '71760.0' — no division needed
+            bids = [(float(b.get("px", "0")), float(b.get("sz", "0"))) for b in raw_bids]
+            asks = [(float(a.get("px", "0")), float(a.get("sz", "0"))) for a in raw_asks]
+
+            return OrderbookSnapshot(timestamp=timestamp, coin=coin, bids=bids, asks=asks)
         except Exception as e:
             logger.error(f"Error fetching L2 snapshot: {e}")
             return None
@@ -745,11 +742,6 @@ class DataPipeline:
         finally:
             await pubsub.unsubscribe(f"l2:{coin}")
             await pubsub.close()
-    
-    async def stream_ticks(self, coin: str) -> AsyncGenerator[Tick, None]:
-        """Stream ticks from the source"""
-        async for tick in self._source.stream_ticks(coin):
-            yield tick
     
     @property
     def source(self) -> BaseDataSource:

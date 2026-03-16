@@ -182,15 +182,15 @@ class OrderflowEngine:
         
         for bid in bids[:10]:
             if isinstance(bid, dict):
-                px = float(bid.get("px", "0")) / 1e6  # Hyperliquid format
+                px = float(bid.get("px", "0"))  # px is decimal USD string e.g. '71760.0'
                 sz = float(bid.get("sz", "0"))
             else:
                 px, sz = float(bid[0]), float(bid[1])
             parsed_bids.append((px, sz))
-        
+
         for ask in asks[:10]:
             if isinstance(ask, dict):
-                px = float(ask.get("px", "0")) / 1e6  # Hyperliquid format
+                px = float(ask.get("px", "0"))
                 sz = float(ask.get("sz", "0"))
             else:
                 px, sz = float(ask[0]), float(ask[1])
@@ -282,11 +282,11 @@ class OrderflowEngine:
                 return self.process_tick(tick_dict)
                 
             elif event.event_type == EventType.L2_UPDATE:
-                # Process as L2 update
+                # Process as L2 update — px is already decimal USD string, no /1e6
                 l2 = event.data
                 l2_dict = {
-                    "bids": [(float(b.get("px", "0")) / 1e6, float(b.get("sz", "0"))) for b in l2.bids],
-                    "asks": [(float(a.get("px", "0")) / 1e6, float(a.get("sz", "0"))) for a in l2.asks]
+                    "bids": [(float(b.get("px", "0")), float(b.get("sz", "0"))) for b in l2.bids],
+                    "asks": [(float(a.get("px", "0")), float(a.get("sz", "0"))) for a in l2.asks]
                 }
                 return self.process_l2(l2_dict)
             
@@ -317,12 +317,24 @@ class OrderflowEngine:
         )
         
         # Calculate absorption from trades
+        trade_absorption = 0.0
         if len(self.trades_buffer) > 0:
             try:
                 df = pd.DataFrame(self.trades_buffer)
-                features.absorption_score = self._calculate_absorption(df)
+                trade_absorption = self._calculate_absorption(df)
             except Exception as e:
-                logger.warning(f"Error calculating absorption: {e}")
+                logger.warning(f"Error calculating trade absorption: {e}")
+        
+        # Calculate L2-based absorption (if we have recent L2 data)
+        l2_absorption = 0.0
+        if len(self.absorption_events) > 0:
+            # Get the most recent absorption event
+            recent_events = [e for e in self.absorption_events if e.get("type") == "L2"]
+            if recent_events:
+                l2_absorption = recent_events[-1].get("score", 0.0)
+        
+        # Combine both absorption scores (favor the higher one)
+        features.absorption_score = max(trade_absorption, l2_absorption)
         
         features.absorption_count = len(self.absorption_events)
         
@@ -336,7 +348,8 @@ class OrderflowEngine:
         if len(self.l2_buffer) > 0:
             try:
                 latest_l2 = self.l2_buffer[-1]
-                features.bid_ask_imbalance = latest_l2.get("imbalance", 0.0)
+                # Use ratio (bid/ask) so strategy thresholds like >2.5 are meaningful
+                features.bid_ask_imbalance = latest_l2.get("imbalance_ratio", 1.0)
                 features.l2_bid_volume = latest_l2.get("bid_volume", 0.0)
                 features.l2_ask_volume = latest_l2.get("ask_volume", 0.0)
                 features.l2_spread = latest_l2.get("spread", 0.0)
@@ -360,14 +373,6 @@ class OrderflowEngine:
                 features.volume_profile_poc = self._calculate_volume_profile_poc(df)
             except Exception as e:
                 logger.warning(f"Error calculating volume profile POC: {e}")
-        
-        return features
-        
-        # Calculate delta divergence
-        features.delta_divergence = self._calculate_delta_divergence(df)
-        
-        # Calculate volume profile POC
-        features.volume_profile_poc = self._calculate_volume_profile_poc(df)
         
         return features
     
@@ -474,7 +479,7 @@ class OrderflowEngine:
         return poc_price
     
     def get_snapshot(self) -> Dict:
-        """Get current state snapshot"""
+        """Get current state snapshot — includes all fields used by DB logging and strategy."""
         features = self._calculate_features()
         return {
             "cvd": features.cvd,
@@ -484,9 +489,14 @@ class OrderflowEngine:
             "delta_divergence": features.delta_divergence,
             "volume_profile_poc": features.volume_profile_poc,
             "trade_count": features.trade_count,
+            "total_buy_volume": features.total_buy_volume,
+            "total_sell_volume": features.total_sell_volume,
+            "l2_bid_volume": features.l2_bid_volume,
+            "l2_ask_volume": features.l2_ask_volume,
+            "l2_spread": features.l2_spread,
             "high": features.high_price,
             "low": features.low_price,
-            "close": features.close_price
+            "close": features.close_price,
         }
     
     def reset(self):
