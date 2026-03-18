@@ -55,6 +55,14 @@ class ExecutionSettings(BaseSettings):
 
 class RedisSettings(BaseSettings):
     """Redis connection settings"""
+    model_config = SettingsConfigDict(
+        env_prefix="REDIS_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore"
+    )
+    
     host: str = "localhost"
     port: int = 6379
     password: str = ""

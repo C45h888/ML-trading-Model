@@ -650,6 +650,9 @@ class DataPipeline:
             async for message in pubsub.listen():
                 if message["type"] == "message":
                     channel = message["channel"]
+                    # Handle both bytes and string channels
+                    if isinstance(channel, bytes):
+                        channel = channel.decode("utf-8")
                     try:
                         data = json.loads(message["data"])
                         

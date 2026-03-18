@@ -93,6 +93,12 @@ class Database:
         try:
             ts = tick.get("timestamp")
             if isinstance(ts, (int, float)):
+                # Hyperliquid returns timestamps in nanoseconds (19 digits)
+                # Convert nanoseconds to seconds if needed
+                if ts > 1_000_000_000_000_000_000:  # > 1 quintillion = nanoseconds
+                    ts = ts / 1_000_000_000  # Convert nanoseconds to seconds
+                elif ts > 1_000_000_000_000:  # > 1 trillion = milliseconds
+                    ts = ts / 1_000  # Convert milliseconds to seconds
                 ts = datetime.fromtimestamp(ts, tz=timezone.utc)
             async with self.pool.acquire() as conn:
                 await conn.execute(

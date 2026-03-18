@@ -76,7 +76,7 @@ class BrainAgent:
         self.strategies = [
             AbsorptionStrategy(
                 min_score=4.0,
-                min_volume=10.0
+                min_trade_count=10
             )
         ]
         

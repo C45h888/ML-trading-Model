@@ -6,14 +6,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source
+# Copy source code
 COPY . .
+
+# Make startup script executable
+RUN chmod +x /app/startup.sh
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-# Default: streaming backtest for BTC, 5 minutes, with DB logging
-CMD ["python", "-m", "brain_agent.backtesting.simple_replay", \
-     "--coin", "BTC", \
-     "--duration-seconds", "300", \
-     "--db-log"]
+# Use startup.sh to bootstrap the agent with proper validation
+ENTRYPOINT ["/app/startup.sh"]

@@ -198,6 +198,28 @@ async def run_backtest_streaming(
     finally:
         if timeout_handle:
             timeout_handle.cancel()
+        
+        # Evaluate any remaining pending signals at session end
+        logger.info(f"Evaluating {len(pending_signals)} pending signals at session end...")
+        while pending_signals:
+            sig_id, direction, entry_price, _ = pending_signals.popleft()
+            if db and sig_id:
+                outcome, pnl_pct = await db.update_signal_outcome(
+                    sig_id, last_price, entry_price, direction
+                )
+            else:
+                pnl_pct = (
+                    (last_price - entry_price) / entry_price * 100
+                    if direction == "LONG"
+                    else (entry_price - last_price) / entry_price * 100
+                )
+                outcome = "WIN" if pnl_pct > 0 else "LOSS"
+            if outcome == "WIN":
+                wins += 1
+            else:
+                losses += 1
+            logger.info(f"  Signal {sig_id}: {outcome} (PnL: {pnl_pct:+.2f}%)")
+        
         await pipeline.disconnect()
 
     total_evaluated = wins + losses
@@ -364,6 +386,27 @@ async def run_backtest(
         except Exception as e:
             logger.error(f"Error at trade {i}: {e}")
 
+    # Evaluate any remaining pending signals at session end
+    logger.info(f"Evaluating {len(pending_signals)} pending signals at session end...")
+    while pending_signals:
+        sig_id, direction, entry_price, _ = pending_signals.popleft()
+        if db and sig_id:
+            outcome, pnl_pct = await db.update_signal_outcome(
+                sig_id, last_price, entry_price, direction
+            )
+        else:
+            pnl_pct = (
+                (last_price - entry_price) / entry_price * 100
+                if direction == "LONG"
+                else (entry_price - last_price) / entry_price * 100
+            )
+            outcome = "WIN" if pnl_pct > 0 else "LOSS"
+        if outcome == "WIN":
+            wins += 1
+        else:
+            losses += 1
+        logger.info(f"  Signal {sig_id}: {outcome} (PnL: {pnl_pct:+.2f}%)")
+
     await pipeline.disconnect()
 
     total_evaluated = wins + losses
@@ -434,8 +477,8 @@ Examples:
     parser.add_argument("--coin", type=str, default="BTC")
     parser.add_argument("--limit", type=int, default=2000,
                         help="Trades to replay in historical mode (default: 2000)")
-    parser.add_argument("--duration-seconds", type=int, default=0,
-                        help="Stream for N seconds (0 = historical replay)")
+    parser.add_argument("--duration-seconds", type=int, default=300,
+                        help="Stream for N seconds (0 = infinite streaming)")
     parser.add_argument("--print-every", type=int, default=100)
     parser.add_argument("--db-log", action="store_true", default=False,
                         help="Enable PostgreSQL logging (requires POSTGRES_* env vars)")
@@ -465,7 +508,7 @@ async def main():
             db = None
 
     try:
-        if args.duration_seconds > 0:
+        if args.duration_seconds >= 0:
             results = await run_backtest_streaming(
                 coin=coin,
                 duration_seconds=args.duration_seconds,
