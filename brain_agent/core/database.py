@@ -77,11 +77,32 @@ class Database:
                     confidence  DOUBLE PRECISION,
                     reason      TEXT,
                     entry_price DOUBLE PRECISION,
+                    position_size DOUBLE PRECISION,
+                    stop_loss   DOUBLE PRECISION,
+                    take_profit DOUBLE PRECISION,
                     outcome     TEXT DEFAULT 'PENDING',
                     exit_price  DOUBLE PRECISION,
+                    exit_reason TEXT,
                     pnl_pct     DOUBLE PRECISION
                 )
             """)
+            
+            # Add new columns to signals table if they don't exist (migration)
+            try:
+                await conn.execute(
+                    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS position_size DOUBLE PRECISION"
+                )
+                await conn.execute(
+                    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS stop_loss DOUBLE PRECISION"
+                )
+                await conn.execute(
+                    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS take_profit DOUBLE PRECISION"
+                )
+                await conn.execute(
+                    "ALTER TABLE signals ADD COLUMN IF NOT EXISTS exit_reason TEXT"
+                )
+            except Exception as e:
+                logger.debug(f"Signal columns migration: {e}")
 
     # ------------------------------------------------------------------
     # Write helpers — each wraps its own try/except so errors are silent

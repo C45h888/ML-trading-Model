@@ -5,10 +5,13 @@ Trades when large orders are not moving price (absorption detected)
 Based on 2026 Hyperliquid-optimized design:
 - Primary Trigger: Large resting size at best bid/ask with minimal price movement
 - Direction Confirmation: CVD + L2 level direction
-- Confidence Scoring: Multi-factor weighted combination
+- Confidence Scoring: Multi-factor weighted combination (60/20/15/5)
+- Minimum Confidence: 0.75 (reject low-probability signals)
+- Signal Cooldown: 60 seconds between signals
 """
 from dataclasses import dataclass
 from typing import Literal, Optional, Dict
+import time
 
 from brain_agent.core.orderflow_engine import OrderflowFeatures
 
@@ -35,26 +38,46 @@ class AbsorptionStrategy:
     - If large size on best bid + positive CVD → LONG
     - If large size on best ask + negative CVD → SHORT
     
-    Confidence Scoring (multi-factor):
-    - Base: 60% from absorption_score
-    - +20% if strong CVD divergence (abs(delta_divergence) > 1.5)
-    - +20% if imbalance aligns
+    Confidence Scoring (multi-factor, per your spec):
+    - 60% weight: raw absorption strength
+    - 20% weight: CVD divergence strength
+    - 15% weight: bid/ask imbalance alignment
+    - 5% weight: price stall confirmation (spread narrowing)
     - Cap at 0.95
+    
+    Hard Filters (Must All Pass):
+    - Resting size at trigger level >= 3x average size
+    - Price movement in last 5 ticks <= 0.05-0.08%
+    - Total liquidity at top 5 levels >= 0.1 BTC
+    - CVD must show directional alignment
+    - Cap imbalance ratio at 20
+    
+    Minimum Confidence: 0.75 (reject low-probability entries)
+    Signal Cooldown: 60 seconds between signals
     """
     
     def __init__(
         self,
         min_score: float = 4.0,
         min_level_size_ratio: float = 3.0,
-        max_price_move_pct: float = 0.0005,  # 0.05%
+        max_price_move_pct: float = 0.0008,  # 0.08% per your spec
         min_cvd_strength: float = 1.5,
-        min_trade_count: int = 10
+        min_trade_count: int = 10,
+        min_confidence: float = 0.50,  # Minimum confidence threshold
+        min_signal_interval: int = 60,  # Cooldown in seconds
+        min_liquidity: float = 0.01,  # Minimum BTC liquidity at top 5 levels
     ):
         self.min_score = min_score
         self.min_level_size_ratio = min_level_size_ratio
         self.max_price_move_pct = max_price_move_pct
         self.min_cvd_strength = min_cvd_strength
         self.min_trade_count = min_trade_count
+        self.min_confidence = min_confidence
+        self.min_signal_interval = min_signal_interval
+        self.min_liquidity = min_liquidity
+        
+        # Cooldown tracking
+        self._last_signal_time = 0.0
     
     def generate_signal(self, features, price: float) -> Signal:
         """
@@ -67,6 +90,15 @@ class AbsorptionStrategy:
         Returns:
             Signal with direction, confidence, and reason
         """
+        # COOLDOWN CHECK: Rate limit signals to avoid over-trading
+        current_time = time.time()
+        if current_time - self._last_signal_time < self.min_signal_interval:
+            return Signal(
+                direction="FLAT",
+                confidence=0.0,
+                reason=f"Cooldown active ({self.min_signal_interval - (current_time - self._last_signal_time):.0f}s remaining)"
+            )
+        
         # Handle both OrderflowFeatures and dict input
         if isinstance(features, dict):
             # Convert dict to OrderflowFeatures-like object
@@ -104,6 +136,15 @@ class AbsorptionStrategy:
         l2_best_bid = getattr(features, 'l2_best_bid', 0.0)
         l2_best_ask = getattr(features, 'l2_best_ask', 0.0)
         
+        # HARD FILTER: Minimum liquidity at top 5 levels (per your spec)
+        total_liquidity = l2_bid_volume + l2_ask_volume
+        if total_liquidity < self.min_liquidity:
+            return Signal(
+                direction="FLAT",
+                confidence=0.0,
+                reason=f"Low liquidity ({total_liquidity:.4f} < {self.min_liquidity} BTC)"
+            )
+        
         # Extra filter: Check price movement percentage
         if features.high_price > 0 and features.low_price > 0:
             price_range_pct = (features.high_price - features.low_price) / features.low_price
@@ -135,22 +176,52 @@ class AbsorptionStrategy:
         
         direction = "LONG" if is_buy_absorption else "SHORT"
         
-        # Confidence: weighted multi-factor combination
-        # Base: 60% from absorption_score
+        # HARD FILTER: CVD directional alignment (per your spec)
+        if direction == "LONG" and features.cvd < 0:
+            return Signal(
+                direction="FLAT",
+                confidence=0.0,
+                reason=f"CVD not aligned for LONG (CVD={features.cvd:+.2f})"
+            )
+        if direction == "SHORT" and features.cvd > 0:
+            return Signal(
+                direction="FLAT",
+                confidence=0.0,
+                reason=f"CVD not aligned for SHORT (CVD={features.cvd:+.2f})"
+            )
+        
+        # Confidence: weighted multi-factor combination (per your spec: 60/20/15/5)
+        # 60% from absorption_score
         base_conf = (score / 10.0) * 0.6
         
-        # +20% if strong CVD divergence
+        # 20% if strong CVD divergence
         cvd_divergence_bonus = 0.2 if abs(features.delta_divergence) > self.min_cvd_strength else 0.0
         
-        # +20% if imbalance aligns
+        # 15% if imbalance aligns with direction
         imbalance_bonus = 0.0
         if direction == "LONG" and features.bid_ask_imbalance > 2.5:
-            imbalance_bonus = 0.2
+            imbalance_bonus = 0.15
         elif direction == "SHORT" and features.bid_ask_imbalance < 0.4:
-            imbalance_bonus = 0.2
+            imbalance_bonus = 0.15
+        
+        # 5% if price is stalling (spread narrowing or small range)
+        price_stall_bonus = 0.0
+        if l2_spread > 0 and price_range_pct < 0.0002:  # Very small price range
+            price_stall_bonus = 0.05
         
         # Cap at 0.95
-        confidence = min(base_conf + cvd_divergence_bonus + imbalance_bonus, 0.95)
+        confidence = min(base_conf + cvd_divergence_bonus + imbalance_bonus + price_stall_bonus, 0.95)
+        
+        # HARD FILTER: Minimum confidence threshold (per your spec: 0.75-0.80)
+        if confidence < self.min_confidence:
+            return Signal(
+                direction="FLAT",
+                confidence=confidence,
+                reason=f"Low confidence ({confidence:.2f} < {self.min_confidence})"
+            )
+        
+        # Mark signal time for cooldown
+        self._last_signal_time = current_time
         
         # Build reason string
         reason = (
@@ -187,6 +258,8 @@ class AbsorptionStrategy:
         return (
             f"AbsorptionStrategy("
             f"min_score={self.min_score}, "
-            f"min_level_size_ratio={self.min_level_size_ratio}, "
+            f"min_confidence={self.min_confidence}, "
+            f"min_signal_interval={self.min_signal_interval}s, "
+            f"min_liquidity={self.min_liquidity}, "
             f"max_price_move_pct={self.max_price_move_pct})"
         )

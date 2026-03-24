@@ -85,6 +85,9 @@ class OrderflowEngine:
     Used by all strategies for consistent feature set.
     """
     
+    # Constants
+    MAX_IMBALANCE_RATIO = 20.0  # Cap to avoid extreme values from near-zero division
+    
     def __init__(
         self, 
         window: int = 500,
@@ -206,7 +209,12 @@ class OrderflowEngine:
         total_volume = bid_volume + ask_volume
         
         # Calculate bid_ask_imbalance = sum(bid_sz) / sum(ask_sz) over top N
-        imbalance_ratio = bid_volume / ask_volume if ask_volume > 0 else 1.0
+        # Cap at MAX_IMBALANCE_RATIO to avoid extreme values from near-zero ask_volume
+        if ask_volume > 0:
+            imbalance_ratio = bid_volume / ask_volume
+            imbalance_ratio = min(imbalance_ratio, self.MAX_IMBALANCE_RATIO)
+        else:
+            imbalance_ratio = 1.0
         
         if total_volume > 0:
             self.l2_buffer.append({
